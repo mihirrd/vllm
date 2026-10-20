@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -74,6 +75,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# kvtier: log the session ID each request carries in vllm_xargs (Gate B check).
+_KVTIER_LOG_SESSIONS = os.environ.get("KVTIER_LOG_SESSIONS") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -2573,6 +2577,14 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if _KVTIER_LOG_SESSIONS:
+                params = request.sampling_params
+                extra = (params.extra_args if params else None) or {}
+                logger.info(
+                    "kvtier: request %s session_id=%s",
+                    request.request_id,
+                    extra.get("session_id"),
+                )
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
