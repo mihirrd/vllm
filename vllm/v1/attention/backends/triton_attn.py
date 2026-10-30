@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
-from dataclasses import dataclass, replace
+import os
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 import torch
+import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -47,6 +49,122 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# kvtier: on Turing (sm_75) the unified kernel runs prefill chunks ~5-10x slower than PyTorch's fused
+# SDPA (which uses tensor cores there), and any prefill in a step also moves that step's decodes onto
+# the kernel's slower 2D path. With KVTIER_SDPA_PREFILL=1, steps that mix decodes and prefills run the
+# decodes through the kernel's 3D path and each prefill chunk through SDPA over KV gathered from the
+# paged cache. Decode-only steps (and their CUDA graphs) are unchanged.
+KVTIER_SDPA_PREFILL = os.environ.get("KVTIER_SDPA_PREFILL", "0") == "1"
+
+
+@dataclass
+class SdpaPrefill:
+    q_start: int
+    q_end: int
+    blocks: torch.Tensor  # (num_blocks,) int64: cache blocks holding this request's KV, in order
+    seq_len: int
+    bias: torch.Tensor  # (query_len, seq_len) additive mask: causal over the new tokens, context visible
+
+
+@dataclass
+class SdpaSplit:
+    """kvtier: one mixed step split into decodes (Triton 3D path) and prefills (SDPA), built once per step."""
+
+    dec_tokens: torch.Tensor  # (num_decodes,) int64 query rows of the decode requests
+    dec_cu_seqlens: torch.Tensor
+    dec_seq_lens: torch.Tensor
+    dec_block_table: torch.Tensor
+    dec_max_seq_len: int
+    prefills: list[SdpaPrefill] = field(default_factory=list)
+
+
+def build_sdpa_split(
+    query_starts: list[int],
+    seq_lens: list[int],
+    seq_lens_gpu: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    dtype: torch.dtype,
+) -> SdpaSplit:
+    dev = block_table.device
+    n = len(seq_lens)
+    dec = [i for i in range(n) if query_starts[i + 1] - query_starts[i] == 1]
+    rows = torch.tensor(dec, dtype=torch.long).to(dev)
+    prefills = []
+    for i in range(n):
+        q_len = query_starts[i + 1] - query_starts[i]
+        if q_len <= 1:
+            continue
+        L = seq_lens[i]
+        # Pad the row length to 16 elements so the mask meets the fused kernel's alignment rule.
+        padded = -(-L // 16) * 16
+        visible = torch.ones(q_len, padded, dtype=torch.bool, device=dev).tril(diagonal=L - q_len)
+        bias = torch.zeros(q_len, padded, dtype=dtype, device=dev).masked_fill_(~visible, float("-inf"))
+        blocks = block_table[i, : -(-L // block_size)].long()
+        prefills.append(SdpaPrefill(query_starts[i], query_starts[i + 1], blocks, L, bias[:, :L]))
+    return SdpaSplit(
+        dec_tokens=torch.tensor([query_starts[i] for i in dec], dtype=torch.long).to(dev),
+        dec_cu_seqlens=torch.arange(len(dec) + 1, dtype=torch.int32, device=dev),
+        dec_seq_lens=seq_lens_gpu[rows],
+        dec_block_table=block_table[rows],
+        dec_max_seq_len=max((seq_lens[i] for i in dec), default=0),
+        prefills=prefills,
+    )
+
+
+def sdpa_split_attention(
+    query: torch.Tensor,  # (num_tokens, num_heads, head_size)
+    key_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, head_size)
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    split: SdpaSplit,
+    scale: float,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    seq_threshold_3D: int,
+    num_par_softmax_segments: int,
+    softmax_segm_output: torch.Tensor,
+    softmax_segm_max: torch.Tensor,
+    softmax_segm_expsum: torch.Tensor,
+) -> None:
+    nd = split.dec_tokens.shape[0]
+    if nd:
+        q_dec = query.index_select(0, split.dec_tokens)
+        out_dec = torch.empty_like(q_dec)
+        unified_attention(
+            q=q_dec,
+            k=key_cache,
+            v=value_cache,
+            out=out_dec,
+            cu_seqlens_q=split.dec_cu_seqlens,
+            max_seqlen_q=1,
+            seqused_k=split.dec_seq_lens,
+            max_seqlen_k=split.dec_max_seq_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=split.dec_block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=k_descale[:nd],
+            v_descale=v_descale[:nd],
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+        )
+        output.index_copy_(0, split.dec_tokens, out_dec)
+    group = query.shape[1] // key_cache.shape[2]
+    for p in split.prefills:
+        k = key_cache.index_select(0, p.blocks).flatten(0, 1)[: p.seq_len]  # (L, Hkv, hs)
+        v = value_cache.index_select(0, p.blocks).flatten(0, 1)[: p.seq_len]
+        q = query[p.q_start : p.q_end].transpose(0, 1).unsqueeze(0)  # (1, Hq, n, hs)
+        k = k.transpose(0, 1).repeat_interleave(group, dim=0).unsqueeze(0)
+        v = v.transpose(0, 1).repeat_interleave(group, dim=0).unsqueeze(0)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=p.bias, scale=scale)
+        output[p.q_start : p.q_end].copy_(o[0].transpose(0, 1))
 
 
 # constants
@@ -94,6 +212,7 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    sdpa_split: SdpaSplit | None = None  # kvtier: set for mixed steps when KVTIER_SDPA_PREFILL=1
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -264,6 +383,18 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             persistent_prefix_lens.copy_(rswa_prefix_lens[:num_reqs])
             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
+
+        if KVTIER_SDPA_PREFILL and max_query_len > 1 and not use_cascade and common_attn_metadata.causal is True:
+            cm = common_attn_metadata
+            seq_lens_cpu = cm.seq_lens_cpu_upper_bound if cm.seq_lens_cpu_upper_bound is not None else cm.seq_lens.cpu()
+            attn_metadata.sdpa_split = build_sdpa_split(
+                cm.query_start_loc_cpu[: num_reqs + 1].tolist(),
+                seq_lens_cpu[:num_reqs].tolist(),
+                cm.seq_lens,
+                block_table_tensor,
+                self.block_size,
+                self.kv_cache_spec.dtype,
+            )
 
         return attn_metadata
 
@@ -542,6 +673,17 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.use_td = td_override
 
+        # kvtier: the SDPA prefill path covers plain causal decoder attention with an fp16/bf16 cache.
+        self._sdpa_ok = (
+            attn_type == AttentionType.DECODER
+            and alibi_slopes is None
+            and self.sliding_window == (-1, -1)
+            and self.logits_soft_cap == 0
+            and sinks is None
+            and not is_quantized_kv_cache(kv_cache_dtype)
+            and chunk_lookback in (None, -1)
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -645,6 +787,31 @@ class TritonAttentionImpl(AttentionImpl):
             v_descale = layer._v_scale.expand(descale_shape)
             k_scale_cache = None
             v_scale_cache = None
+
+        split = attn_metadata.sdpa_split
+        if (
+            split is not None
+            and self._sdpa_ok
+            and output_scale is None
+            and attn_metadata.mm_prefix_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+        ):
+            sdpa_split_attention(
+                query,
+                key_cache,
+                value_cache,
+                output,
+                split,
+                self.scale,
+                k_descale,
+                v_descale,
+                attn_metadata.seq_threshold_3D,
+                attn_metadata.num_par_softmax_segments,
+                attn_metadata.softmax_segm_output,
+                attn_metadata.softmax_segm_max,
+                attn_metadata.softmax_segm_expsum,
+            )
+            return output
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
