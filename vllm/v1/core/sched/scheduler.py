@@ -80,6 +80,12 @@ logger = init_logger(__name__)
 _KVTIER_LOG_SESSIONS = os.environ.get("KVTIER_LOG_SESSIONS") == "1"
 
 
+def _kvtier_xargs(request: Request) -> dict:
+    """kvtier fields the replay harness sends in vllm_xargs (session_id, program, pause_s)."""
+    params = request.sampling_params
+    return (params.extra_args if params else None) or {}
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -2577,6 +2583,9 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            kvtier = self.kv_cache_manager.block_pool.kvtier
+            if kvtier is not None and (sid := _kvtier_xargs(request).get("session_id")):
+                kvtier.on_arrival(sid, time.monotonic())
             if _KVTIER_LOG_SESSIONS:
                 params = request.sampling_params
                 extra = (params.extra_args if params else None) or {}
@@ -2692,6 +2701,18 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        kvtier = self.kv_cache_manager.block_pool.kvtier
+        if kvtier is not None:
+            extra = _kvtier_xargs(request)
+            if sid := extra.get("session_id"):
+                pause = extra.get("pause_s")
+                kvtier.on_finish(
+                    sid,
+                    extra.get("program") or "",
+                    None if pause is None else float(pause),
+                    self.kv_cache_manager.coordinator.get_blocks(request.request_id)[0],
+                    time.monotonic(),
+                )
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 

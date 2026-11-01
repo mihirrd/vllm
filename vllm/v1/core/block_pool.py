@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -27,6 +28,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
     to_event_extra_keys,
 )
+from vllm.v1.core.kvtier_sessions import make_session_eviction
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -194,6 +196,13 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+
+        # kvtier: evict paused sessions' cached blocks in policy order (None = LRU).
+        self.kvtier = (
+            make_session_eviction()
+            if enable_caching and medium == MEDIUM_GPU
+            else None
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -681,7 +690,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.kvtier is not None:
+            ret = self._kvtier_get_new_blocks(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -700,6 +712,29 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        return ret
+
+    def _kvtier_get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Like popleft_n, but cached blocks to evict come from the session policy."""
+        assert self.kvtier is not None
+        queue = self.free_block_queue
+        # Uncached free blocks sit at the front of the queue; using them evicts nothing.
+        num_uncached = 0
+        block = queue.fake_free_list_head.next_free_block
+        while (
+            num_uncached < num_blocks
+            and block is not queue.fake_free_list_tail
+            and block is not None
+            and block.block_hash is None
+        ):
+            num_uncached += 1
+            block = block.next_free_block
+        ret = queue.popleft_n(num_uncached) if num_uncached else []
+        if len(ret) < num_blocks:
+            ret += self.kvtier.take(queue, num_blocks - len(ret), time.monotonic())
+        if len(ret) < num_blocks:
+            ret += queue.popleft_n(num_blocks - len(ret))
+        self.kvtier.on_allocated(ret)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
