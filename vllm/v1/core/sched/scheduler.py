@@ -53,6 +53,11 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.kvtier_continuum import (
+    ContinuumRequestQueue,
+    make_continuum,
+    session_of,
+)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
@@ -220,6 +225,10 @@ class Scheduler(SchedulerInterface):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
+        # kvtier baseline: Continuum's pins and queue order (KVTIER_SCHED=continuum).
+        self.continuum = make_continuum()
+        if self.continuum is not None:
+            self.waiting = ContinuumRequestQueue(self.continuum)
         # Waiting requests that hold KV blocks are always drained before
         # self.waiting: a block-holder must never sit behind a request whose
         # failed allocation would stop the scheduling scan.
@@ -571,6 +580,11 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.continuum is not None:
+            waiting = {session_of(r) for r in self.waiting}
+            waiting |= {session_of(r) for r in self.kv_holding_waiting}
+            for pinned in self.continuum.expired_pins(waiting, time.monotonic()):
+                self._free_request_blocks(pinned)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -777,6 +791,14 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                    elif self.continuum is not None:
+                        # Continuum: with at most one running, give up a pin first.
+                        if len(self.running) <= 1 and (
+                            pinned := self.continuum.release_latest()
+                        ):
+                            self._free_request_blocks(pinned)
+                            continue
+                        preempted_req = max(self.running, key=self.continuum.preempt_key)
                     else:
                         preempted_req = self.running[-1]
 
@@ -784,7 +806,10 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or self.continuum is not None
+                    ):
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -1237,6 +1262,12 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # Continuum: nothing running and nothing fits, so a pin goes.
+                    if self.continuum is not None and not self.running and (
+                        pinned := self.continuum.release_latest()
+                    ):
+                        self.continuum.deadlock_unpins += 1
+                        self._free_request_blocks(pinned)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -2586,6 +2617,8 @@ class Scheduler(SchedulerInterface):
             kvtier = self.kv_cache_manager.block_pool.kvtier
             if kvtier is not None and (sid := _kvtier_xargs(request).get("session_id")):
                 kvtier.on_arrival(sid, time.monotonic())
+            if self.continuum is not None:
+                self.continuum.on_arrival(request, time.monotonic())
             if _KVTIER_LOG_SESSIONS:
                 params = request.sampling_params
                 extra = (params.extra_args if params else None) or {}
@@ -2713,6 +2746,13 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.coordinator.get_blocks(request.request_id)[0],
                     time.monotonic(),
                 )
+        if self.continuum is not None:
+            release, pin = self.continuum.on_finish(request, time.monotonic())
+            for pinned in release:
+                self._free_request_blocks(pinned)
+            if pin:  # blocks stay held until the pin is released
+                del self.requests[request.request_id]
+                return
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
