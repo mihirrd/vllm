@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""kvtier (C1): session table and policy-ordered eviction of paused sessions' cached blocks.
+"""brb (C1): session table and policy-ordered eviction of paused sessions' cached blocks.
 
-Enabled with KVTIER_POLICY=remaining (our remaining-time eviction) or KVTIER_POLICY=oracle
+Enabled with BRB_POLICY=remaining (our remaining-time eviction) or BRB_POLICY=oracle
 (Belady: the true pause, sent by the replay harness). Unset, vLLM's LRU order is untouched.
 
 The scheduler reports each request's arrival and finish; the session ID, the program of the tool
@@ -19,25 +19,29 @@ from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
 logger = init_logger(__name__)
 
-POLICY = os.environ.get("KVTIER_POLICY", "")
+POLICY = os.environ.get("BRB_POLICY", "")
+# Where the tool pause history is kept across restarts (remaining only). Unset: every server starts
+# with no history, as in the experiments.
+PAUSE_DB = os.environ.get("BRB_PAUSE_DB", "")
 _REORDER_EVERY_S = 0.25  # time left changes slowly; re-rank at most this often unless sessions change
 _LOG_EVERY_S = 30.0
+_SAVE_EVERY_S = 60.0  # a crash loses at most this much pause history
 
 
 def make_session_eviction() -> "SessionEviction | None":
     if POLICY in ("", "lru"):
         return None
     if POLICY not in ("remaining", "oracle"):
-        raise ValueError(f"KVTIER_POLICY={POLICY!r}: expected remaining, oracle or lru")
-    logger.info("kvtier: session eviction policy %s", POLICY)
-    return SessionEviction(oracle=POLICY == "oracle")
+        raise ValueError(f"BRB_POLICY={POLICY!r}: expected remaining, oracle or lru")
+    logger.info("brb: session eviction policy %s", POLICY)
+    return SessionEviction(oracle=POLICY == "oracle", pause_db=PAUSE_DB or None)
 
 
 class SessionEviction:
-    def __init__(self, oracle: bool):
-        # The policy is shared with the simulator (kvtier package, installed in the same env).
-        from kvtier.policy import Session, State
-        from kvtier.sim.policies import RemainingTimeEviction
+    def __init__(self, oracle: bool, pause_db: str | None = None):
+        # The policy is shared with the simulator (brb package, installed in the same env).
+        from brb.policy import Session, State
+        from brb.sim.policies import RemainingTimeEviction
 
         self._Session, self._State = Session, State
         self.policy = RemainingTimeEviction(oracle=oracle)
@@ -58,6 +62,13 @@ class SessionEviction:
         self.evicted_by_policy = 0
         self.evicted_by_lru = 0
         self._log_t = time.monotonic()
+        # The oracle reads true pauses and learns nothing, so it has no history to keep.
+        self.pause_db = None if oracle else pause_db
+        self._unsaved = False
+        self._saved_t = -1e9
+        if self.pause_db:
+            n = self.policy.predictor.load(self.pause_db)
+            logger.info("brb: loaded pause history for %d programs from %s", n, self.pause_db)
 
     def on_arrival(self, sid: str, now: float) -> None:
         s = self.sessions.get(sid)
@@ -68,12 +79,23 @@ class SessionEviction:
             pause = now - s.pause_start
             if s.session_id in self._victims:
                 chain = self.chains.get(sid, ())
-                logger.info("kvtier: return sid=%s program=%s pause=%.2f evicted, %d blocks left",
+                logger.info("brb: return sid=%s program=%s pause=%.2f evicted, %d blocks left",
                             sid, s.program, pause, sum(self.owner.get(b.block_id) == sid for b in chain))
             self._victims.discard(sid)
             self.policy.on_return(s, pause)
-            self._dirty = True
+            self._dirty = self._unsaved = True
+            self._maybe_save(now)
         s.state = self._State.ACTIVE
+
+    def _maybe_save(self, now: float) -> None:
+        if not (self.pause_db and self._unsaved) or now - self._saved_t < _SAVE_EVERY_S:
+            return
+        try:
+            self.policy.predictor.save(self.pause_db)
+            self._unsaved, self._saved_t = False, now
+        except OSError as e:  # a full or read-only disk must not take the server down
+            logger.warning("brb: could not save pause history to %s: %s", self.pause_db, e)
+            self._saved_t = now
 
     def on_finish(self, sid: str, program: str, true_pause_s: float | None,
                   blocks: list[KVCacheBlock], now: float) -> None:
@@ -126,7 +148,7 @@ class SessionEviction:
                 continue
             if sid not in self._victims:
                 self._victims.add(sid)
-                logger.info("kvtier: victim sid=%s program=%s elapsed=%.2f time_left=%.2f paused=%d",
+                logger.info("brb: victim sid=%s program=%s elapsed=%.2f time_left=%.2f paused=%d",
                             sid, s.program, now - s.pause_start, self.policy.time_left(s, now), len(self._order))
             while chain and len(out) < n:
                 b = chain.pop()
@@ -145,7 +167,7 @@ class SessionEviction:
         self.evicted_by_lru += n - len(out)
         if now - self._log_t > _LOG_EVERY_S:
             self._log_t = now
-            logger.info("kvtier: evicted %d orphan blocks, %d by policy, %d by LRU fallback; %d paused "
+            logger.info("brb: evicted %d orphan blocks, %d by policy, %d by LRU fallback; %d paused "
                         "sessions hold blocks", self.evicted_orphans, self.evicted_by_policy,
                         self.evicted_by_lru, len(self.chains))
         return out

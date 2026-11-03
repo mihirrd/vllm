@@ -53,7 +53,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.kvtier_continuum import (
+from vllm.v1.core.brb_continuum import (
     ContinuumRequestQueue,
     make_continuum,
     session_of,
@@ -81,12 +81,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# kvtier: log the session ID each request carries in vllm_xargs (Gate B check).
-_KVTIER_LOG_SESSIONS = os.environ.get("KVTIER_LOG_SESSIONS") == "1"
+# brb: log the session ID each request carries in vllm_xargs (Gate B check).
+_BRB_LOG_SESSIONS = os.environ.get("BRB_LOG_SESSIONS") == "1"
 
 
-def _kvtier_xargs(request: Request) -> dict:
-    """kvtier fields the replay harness sends in vllm_xargs (session_id, program, pause_s)."""
+def _brb_xargs(request: Request) -> dict:
+    """brb fields the replay harness sends in vllm_xargs (session_id, program, pause_s)."""
     params = request.sampling_params
     return (params.extra_args if params else None) or {}
 
@@ -225,7 +225,7 @@ class Scheduler(SchedulerInterface):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
-        # kvtier baseline: Continuum's pins and queue order (KVTIER_SCHED=continuum).
+        # brb baseline: Continuum's pins and queue order (BRB_SCHED=continuum).
         self.continuum = make_continuum()
         if self.continuum is not None:
             self.waiting = ContinuumRequestQueue(self.continuum)
@@ -2614,16 +2614,16 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
-            kvtier = self.kv_cache_manager.block_pool.kvtier
-            if kvtier is not None and (sid := _kvtier_xargs(request).get("session_id")):
-                kvtier.on_arrival(sid, time.monotonic())
+            brb = self.kv_cache_manager.block_pool.brb
+            if brb is not None and (sid := _brb_xargs(request).get("session_id")):
+                brb.on_arrival(sid, time.monotonic())
             if self.continuum is not None:
                 self.continuum.on_arrival(request, time.monotonic())
-            if _KVTIER_LOG_SESSIONS:
+            if _BRB_LOG_SESSIONS:
                 params = request.sampling_params
                 extra = (params.extra_args if params else None) or {}
                 logger.info(
-                    "kvtier: request %s session_id=%s",
+                    "brb: request %s session_id=%s",
                     request.request_id,
                     extra.get("session_id"),
                 )
@@ -2734,12 +2734,12 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
-        kvtier = self.kv_cache_manager.block_pool.kvtier
-        if kvtier is not None:
-            extra = _kvtier_xargs(request)
+        brb = self.kv_cache_manager.block_pool.brb
+        if brb is not None:
+            extra = _brb_xargs(request)
             if sid := extra.get("session_id"):
                 pause = extra.get("pause_s")
-                kvtier.on_finish(
+                brb.on_finish(
                     sid,
                     extra.get("program") or "",
                     None if pause is None else float(pause),

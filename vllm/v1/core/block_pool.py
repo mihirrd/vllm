@@ -28,7 +28,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
     to_event_extra_keys,
 )
-from vllm.v1.core.kvtier_sessions import make_session_eviction
+from vllm.v1.core.brb_sessions import make_session_eviction
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -197,8 +197,8 @@ class BlockPool:
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
 
-        # kvtier: evict paused sessions' cached blocks in policy order (None = LRU).
-        self.kvtier = (
+        # brb: evict paused sessions' cached blocks in policy order (None = LRU).
+        self.brb = (
             make_session_eviction()
             if enable_caching and medium == MEDIUM_GPU
             else None
@@ -690,8 +690,8 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        if self.kvtier is not None:
-            ret = self._kvtier_get_new_blocks(num_blocks)
+        if self.brb is not None:
+            ret = self._brb_get_new_blocks(num_blocks)
         else:
             ret = self.free_block_queue.popleft_n(num_blocks)
 
@@ -714,9 +714,9 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
-    def _kvtier_get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def _brb_get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Like popleft_n, but cached blocks to evict come from the session policy."""
-        assert self.kvtier is not None
+        assert self.brb is not None
         queue = self.free_block_queue
         # Uncached free blocks sit at the front of the queue; using them evicts nothing.
         num_uncached = 0
@@ -731,10 +731,10 @@ class BlockPool:
             block = block.next_free_block
         ret = queue.popleft_n(num_uncached) if num_uncached else []
         if len(ret) < num_blocks:
-            ret += self.kvtier.take(queue, num_blocks - len(ret), time.monotonic())
+            ret += self.brb.take(queue, num_blocks - len(ret), time.monotonic())
         if len(ret) < num_blocks:
             ret += queue.popleft_n(num_blocks - len(ret))
-        self.kvtier.on_allocated(ret)
+        self.brb.on_allocated(ret)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:

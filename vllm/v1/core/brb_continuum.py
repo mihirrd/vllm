@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""kvtier baseline: Continuum (arXiv 2511.02230), ported from the authors' vLLM 0.10.2 release.
+"""brb baseline: Continuum (arXiv 2511.02230), ported from the authors' vLLM 0.10.2 release.
 
-Enabled with KVTIER_SCHED=continuum. Source: github.com/Hanchenli/vllm-continuum (commit 316a587),
+Enabled with BRB_SCHED=continuum. Source: github.com/Hanchenli/vllm-continuum (commit 316a587),
 vllm/v1/core/sched/scheduler.py, request_queue.py and estimate_with_func.py. Their release ships a
 fixed pin rule ("without the estimation in the paper"), which this port follows:
 
@@ -17,7 +17,7 @@ fixed pin rule ("without the estimation in the paper"), which this port follows:
 
 Their parser reads the tool name from the model's reply and the client flags the last step; the
 replay harness sends both in vllm_xargs (program; pause_s is absent on a session's last turn).
-Unpinned blocks are evicted by vLLM's LRU, or by KVTIER_POLICY if that is set too.
+Unpinned blocks are evicted by vLLM's LRU, or by BRB_POLICY if that is set too.
 """
 
 import os
@@ -29,7 +29,7 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
-SCHED = os.environ.get("KVTIER_SCHED", "")
+SCHED = os.environ.get("BRB_SCHED", "")
 PIN_S = 2.0  # FIXED_THRESHOLD_CONTINUUM in their release
 _LOG_EVERY_S = 30.0
 
@@ -38,8 +38,8 @@ def make_continuum() -> "Continuum | None":
     if SCHED == "":
         return None
     if SCHED != "continuum":
-        raise ValueError(f"KVTIER_SCHED={SCHED!r}: expected continuum")
-    logger.info("kvtier: Continuum scheduling, %.1f s pins", PIN_S)
+        raise ValueError(f"BRB_SCHED={SCHED!r}: expected continuum")
+    logger.info("brb: Continuum scheduling, %.1f s pins", PIN_S)
     return Continuum()
 
 
@@ -126,7 +126,7 @@ class Continuum:
         if now - self._log_t >= _LOG_EVERY_S:
             self._log_t = now
             logger.info(
-                "kvtier: continuum %d pins, %d expired, %d released early (%d deadlock); %d held now",
+                "brb: continuum %d pins, %d expired, %d released early (%d deadlock); %d held now",
                 self.pins, self.expired, self.released_early, self.deadlock_unpins, len(self.pinned),
             )
 

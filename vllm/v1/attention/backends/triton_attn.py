@@ -50,12 +50,12 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
-# kvtier: on Turing (sm_75) the unified kernel runs prefill chunks ~5-10x slower than PyTorch's fused
+# brb: on Turing (sm_75) the unified kernel runs prefill chunks ~5-10x slower than PyTorch's fused
 # SDPA (which uses tensor cores there), and any prefill in a step also moves that step's decodes onto
-# the kernel's slower 2D path. With KVTIER_SDPA_PREFILL=1, steps that mix decodes and prefills run the
+# the kernel's slower 2D path. With BRB_SDPA_PREFILL=1, steps that mix decodes and prefills run the
 # decodes through the kernel's 3D path and each prefill chunk through SDPA over KV gathered from the
 # paged cache. Decode-only steps (and their CUDA graphs) are unchanged.
-KVTIER_SDPA_PREFILL = os.environ.get("KVTIER_SDPA_PREFILL", "0") == "1"
+BRB_SDPA_PREFILL = os.environ.get("BRB_SDPA_PREFILL", "0") == "1"
 
 
 @dataclass
@@ -69,7 +69,7 @@ class SdpaPrefill:
 
 @dataclass
 class SdpaSplit:
-    """kvtier: one mixed step split into decodes (Triton 3D path) and prefills (SDPA), built once per step."""
+    """brb: one mixed step split into decodes (Triton 3D path) and prefills (SDPA), built once per step."""
 
     dec_tokens: torch.Tensor  # (num_decodes,) int64 query rows of the decode requests
     dec_cu_seqlens: torch.Tensor
@@ -212,7 +212,7 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
-    sdpa_split: SdpaSplit | None = None  # kvtier: set for mixed steps when KVTIER_SDPA_PREFILL=1
+    sdpa_split: SdpaSplit | None = None  # brb: set for mixed steps when BRB_SDPA_PREFILL=1
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -384,7 +384,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
 
-        if KVTIER_SDPA_PREFILL and max_query_len > 1 and not use_cascade and common_attn_metadata.causal is True:
+        if BRB_SDPA_PREFILL and max_query_len > 1 and not use_cascade and common_attn_metadata.causal is True:
             cm = common_attn_metadata
             seq_lens_cpu = cm.seq_lens_cpu_upper_bound if cm.seq_lens_cpu_upper_bound is not None else cm.seq_lens.cpu()
             attn_metadata.sdpa_split = build_sdpa_split(
@@ -673,7 +673,7 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.use_td = td_override
 
-        # kvtier: the SDPA prefill path covers plain causal decoder attention with an fp16/bf16 cache.
+        # brb: the SDPA prefill path covers plain causal decoder attention with an fp16/bf16 cache.
         self._sdpa_ok = (
             attn_type == AttentionType.DECODER
             and alibi_slopes is None
